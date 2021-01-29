@@ -153,9 +153,18 @@ class CactusJob(RoundedJob):
         return getOptionalAttrib(node=self.jobNode, attribName=attribName, typeFn=typeFn, default=default)
 
     def addService(self, job):
-        """Works around toil issue #1695, returning a Job rather than a Promise."""
-        super(CactusJob, self).addService(job)
-        return self._services[-1]
+        """Works around toil issue #1695, returning something we can index for multiple return values."""
+        rv = super(CactusJob, self).addService(job)
+        if hasattr(rv, '__getitem__'):
+            # New Toil. Promise we got is indexable for more sub-Promises.
+            # Return the indexable root return value promise, from which
+            # promises for different indexes can be obtained.
+            return rv
+        else:
+            # Running on old Toil. Return the whole service host job so we can
+            # get more Promises out of it. TODO: Remove this when everyone has
+            # upgraded Toil.
+            return self._services[-1]
 
 class CactusPhasesJob(CactusJob):
     """Base job for each workflow phase job.
@@ -187,7 +196,13 @@ class CactusPhasesJob(CactusJob):
             memory = max(2500000000, self.evaluateResourcePoly([4.10201882, 2.01324291e+08]))
             cpu = cw.getKtserverCpu(default=0.1)
             dbElem = ExperimentWrapper(self.cactusWorkflowArguments.scratchDbElemNode)
-            dbString = self.addService(DbServerService(dbElem=dbElem, isSecondary=True, memory=memory, cores=cpu)).rv(0)
+            dbRet = self.addService(DbServerService(dbElem=dbElem, isSecondary=True, memory=memory, cores=cpu))
+            if hasattr(dbRet, '__getitem__'):
+                # New Toil: indexable promise
+                dbString = dbRet[0]
+            else:
+                # Old Toil: we have a whole service host job
+                dbString = dbRet.rv(0)
             newChild.phaseNode.attrib["secondaryDatabaseString"] = dbString
             return self.addChild(newChild).rv()
         else:
@@ -277,12 +292,18 @@ class StartPrimaryDB(CactusPhasesJob):
             memory = max(2500000000, self.evaluateResourcePoly([4.10201882, 2.01324291e+08]))
             cores = cw.getKtserverCpu(default=0.1)
             dbElem = ExperimentWrapper(self.cactusWorkflowArguments.experimentNode)
-            service = self.addService(DbServerService(dbElem=dbElem,
-                                                      existingSnapshotID=self.dbServerDump,
-                                                      isSecondary=False,
-                                                      memory=memory, cores=cores))
-            dbString = service.rv(0)
-            snapshotID = service.rv(1)
+            dbRet = self.addService(DbServerService(dbElem=dbElem,
+                                                    existingSnapshotID=self.dbServerDump,
+                                                    isSecondary=False,
+                                                    memory=memory, cores=cores))
+            if hasattr(dbRet, '__getitem__'):
+                # New Toil: indexable promise
+                dbString = dbRet[0]
+                snapshotID = dbRet[1]
+            else:
+                # Old Toil with hack: entire service host job
+                dbString = dbRet.rv(0)
+                snapshotID = dbRet.rv(1)
             self.nextJob.cactusWorkflowArguments.cactusDiskDatabaseString = dbString
             # TODO: This part needs to be cleaned up
             self.nextJob.cactusWorkflowArguments.snapshotID = snapshotID
@@ -465,26 +486,40 @@ class CactusRecursionJob(CactusJob):
 ############################################################
 ############################################################
 
-def prependUniqueIDs(fas, outputDir, idMap=None, firstID=0):
+def prependUniqueIDs(eventToFa, outputDir, idMap=None, firstID=0, eventNameAsID=None):
     """Prepend unique ints to fasta headers.
 
     (prepend rather than append since trimmed outgroups have a start
     token appended, which complicates removal slightly)
+    
+    The input is a map from event name to fasta path
+
+    Numeric IDs (on by default) make sense for normal cactus which churns out heaps of giant cigar files. They 
+    are based on a sorted order of the input event names. 
+    Event Name IDs are better for paf-based pipeline as they are stable across commands even when working on subsets of events
     """
+    if eventNameAsID is None:
+        eventNameAsID = os.environ.get('CACTUS_EVENT_NAME_AS_UNIQUE_ID', False)
+        eventNameAsID = False if not bool(eventNameAsID) or eventNameAsID == '0' else True
+
     uniqueID = firstID
-    ret = []
-    for fa in fas:
-        outPath = os.path.join(outputDir, os.path.basename(fa))
-        out = open(outPath, 'w')
-        for line in open(fa):
-            if len(line) > 0 and line[0] == '>':
-                header = "id=%d|%s" % (uniqueID, line[1:-1])
-                out.write(">%s\n" % header)
-                if idMap is not None:
-                    idMap[line[1:-1].rstrip()] = header.rstrip()
-            else:
-                out.write(line)
-        ret.append(outPath)
+    ret = {}
+    for event in sorted(eventToFa.keys()):
+        fa = eventToFa[event]
+        # can handle none-values which serve only to space ids -- dont show in output
+        if fa:
+            outPath = os.path.join(outputDir, os.path.basename(fa))
+            out = open(outPath, 'w')
+            for line in open(fa):
+                if len(line) > 0 and line[0] == '>':
+                    idTag = event if eventNameAsID else uniqueID
+                    header = "id={}|{}".format(idTag, line[1:-1])
+                    out.write(">%s\n" % header)
+                    if idMap is not None:
+                        idMap[line[1:-1].rstrip()] = header.rstrip()
+                else:
+                    out.write(line)
+            ret[event] = outPath
         uniqueID += 1
     return ret
 
@@ -518,25 +553,27 @@ class CactusTrimmingBlastPhase(CactusPhasesJob):
     def run(self, fileStore):
         fileStore.logToMaster("Running blast using the trimming strategy")
 
+        # download the sequences
         exp = self.cactusWorkflowArguments.experimentWrapper
-        ingroupsAndOriginalIDs = [(g, exp.getSequenceID(g)) for g in exp.getGenomesWithSequence() if g not in exp.getOutgroupGenomes()]
-        outgroupsAndOriginalIDs = [(g, exp.getSequenceID(g)) for g in exp.getOutgroupGenomes()]
-        from sonLib.nxnewick import NXNewick
-        print((NXNewick().writeString(exp.getTree())))
-        print((exp.getRootGenome()))
-        print(ingroupsAndOriginalIDs)
-        print(outgroupsAndOriginalIDs)
-        sequences = [fileStore.readGlobalFile(id) for id in map(itemgetter(1), ingroupsAndOriginalIDs + outgroupsAndOriginalIDs)]
-        self.cactusWorkflowArguments.totalSequenceSize = sum(os.stat(x).st_size for x in sequences)
+        igEvents = [g for g in exp.getGenomesWithSequence() if g not in exp.getOutgroupGenomes()]
+        ogEvents = [g for g in exp.getOutgroupGenomes()]
+        eventToSequence = {}
+        for event in igEvents + ogEvents:
+            eventToSequence[event] = fileStore.readGlobalFile(exp.getSequenceID(event))
 
+        # prepend the ids
         renamedInputSeqDir = fileStore.getLocalTempDir()
-        uniqueFas = prependUniqueIDs(sequences, renamedInputSeqDir)
-        uniqueFaIDs = [fileStore.writeGlobalFile(seq, cleanup=True) for seq in uniqueFas]
+        eventToUnique = prependUniqueIDs(eventToSequence, renamedInputSeqDir)
 
-        # Set the uniquified IDs for the ingroups and outgroups
-        ingroupsAndNewIDs = list(zip(list(map(itemgetter(0), ingroupsAndOriginalIDs)), uniqueFaIDs[:len(ingroupsAndOriginalIDs)]))
-        outgroupsAndNewIDs = list(zip(list(map(itemgetter(0), outgroupsAndOriginalIDs)), uniqueFaIDs[len(ingroupsAndOriginalIDs):]))
-
+        # upload them and remember the size
+        eventToUniqueID = {}
+        for event, uniqueFa in eventToUnique.items():
+            eventToUniqueID[event] = fileStore.writeGlobalFile(eventToUnique[event], cleanup=True)
+        self.cactusWorkflowArguments.totalSequenceSize = sum(os.stat(x).st_size for x in eventToSequence.values())
+            
+        ingroupsAndNewIDs = [(event, eventToUniqueID[event]) for event in igEvents]
+        outgroupsAndNewIDs = [(event, eventToUniqueID[event]) for event in ogEvents]
+            
         # Change the blast arguments depending on the divergence
         setupDivergenceArgs(self.cactusWorkflowArguments)
         setupFilteringByIdentity(self.cactusWorkflowArguments)
