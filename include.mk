@@ -38,11 +38,17 @@ include ${sonLibRootDir}/include.mk
 #https://github.com/ComparativeGenomicsToolkit/cactus/issues/235
 CFLAGS += -UNDEBUG
 
-# Hack to include libxml2
-CFLAGS+= -I/usr/include/libxml2 -lxml2 ${LDFLAGS}
+# include openmp and xml2
+CFLAGS+= -fopenmp -I/usr/include/libxml2
+
+ifndef TARGETOS
+  TARGETOS := $(shell uname -s)
+endif
 
 # Hack to include openmp on os x after "brew install lomp
-CFLAGS+= -Xpreprocessor -fopenmp -lomp
+ifeq ($(TARGETOS), Darwin)
+	CFLAGS+= -Xpreprocessor -lomp
+endif
 
 dataSetsPath=/Users/benedictpaten/Dropbox/Documents/work/myPapers/genomeCactusPaper/dataSets
 
@@ -66,5 +72,5 @@ sonLibLibs = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a
 
 databaseLibs = ${kyotoTycoonLib} ${tokyoCabinetLib} ${hiredisLib}
 
-LDLIBS += ${cactusLibs} ${sonLibLibs} ${databaseLibs} ${LIBS} -lm -labpoa
+LDLIBS += ${cactusLibs} ${sonLibLibs} ${databaseLibs} ${LIBS} -lm -labpoa -lxml2
 LIBDEPENDS = ${sonLibDir}/sonLib.a ${sonLibDir}/cuTest.a
