@@ -135,7 +135,7 @@ int64_t *cactusParams_get_ints(CactusParams *p, int64_t *length, int num, ...) {
     va_list args;
     va_start(args, num);
 
-    char *c = cactusParams_get_string2(p, num, args);
+    const char *c = cactusParams_get_string2(p, num, args);
     stList *l = stString_split(c);
     *length = stList_length(l);
     int64_t *ints = st_malloc(sizeof(int64_t) * *length);
